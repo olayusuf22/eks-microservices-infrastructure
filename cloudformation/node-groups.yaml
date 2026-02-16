@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS Managed Node Groups for microservices workloads'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix (must match previous stacks)
+    Type: String
+    Default: eks-prod
+  
+  NodeGroupName:
+    Description: Name for the node group
+    Type: String
+    Default: microservices-nodes
+  
+  NodeInstanceType:
+    Description: EC2 instance type for nodes
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+  
+  NodeAutoScalingGroupMinSize:
+    Description: Minimum number of nodes
+    Type: Number
+    Default: 2
+  
+  NodeAutoScalingGroupDesiredCapacity:
+    Description: Desired number of nodes
+    Type: Number
+    Default: 3
+  
+  NodeAutoScalingGroupMaxSize:
+    Description: Maximum number of nodes
+    Type: Number
+    Default: 6
+  
+  NodeVolumeSize:
+    Description: Node volume size in GB
+    Type: Number
+    Default: 50
+
+Resources:
+  # Launch Template for custom configuration
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${EnvironmentName}-${NodeGroupName}-template
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref NodeVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-${NodeGroupName}
+              - Key: Environment
+                Value: !Ref EnvironmentName
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-${NodeGroupName}-volume
+
+  # Managed Node Group
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      NodegroupName: !Ref NodeGroupName
+      ClusterName:
+        Fn::ImportValue: !Sub ${EnvironmentName}-ClusterName
+      NodeRole:
+        Fn::ImportValue: !Sub ${EnvironmentName}-NodeRoleArn
+      Subnets: !Split
+        - ','
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnets
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      ScalingConfig:
+        MinSize: !Ref NodeAutoScalingGroupMinSize
+        DesiredSize: !Ref NodeAutoScalingGroupDesiredCapacity
+        MaxSize: !Ref NodeAutoScalingGroupMaxSize
+      UpdateConfig:
+        MaxUnavailable: 1
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      Labels:
+        workload: microservices
+        nodegroup: !Ref NodeGroupName
+      Tags:
+        Name: !Sub ${EnvironmentName}-${NodeGroupName}
+        Environment: !Ref EnvironmentName
+
+Outputs:
+  NodeGroupName:
+    Description: Node Group Name
+    Value: !Ref NodeGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-NodeGroupName
+
+  NodeGroupArn:
+    Description: Node Group ARN
+    Value: !GetAtt NodeGroup.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-NodeGroupArn

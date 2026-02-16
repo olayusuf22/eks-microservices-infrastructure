@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS cluster with IAM roles and OIDC provider'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix (must match VPC stack)
+    Type: String
+    Default: eks-prod
+  
+  KubernetesVersion:
+    Description: Kubernetes version
+    Type: String
+    Default: '1.30'
+    AllowedValues:
+      - '1.28'
+      - '1.29'
+      - '1.30'
+
+Resources:
+  # EKS Cluster IAM Role
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-eks-cluster-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSVPCResourceController
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-eks-cluster-role
+
+  # EKS Cluster
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref EnvironmentName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub ${EnvironmentName}-ControlPlaneSecurityGroup
+        SubnetIds: !Split
+          - ','
+          - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnets
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - 0.0.0.0/0
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  # OIDC Provider for IRSA
+  EKSClusterOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+
+  # Node Group IAM Role
+  EKSNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-eks-node-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-eks-node-role
+
+  # Additional Policy for EBS CSI Driver
+  EKSNodeAdditionalPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-eks-node-additional
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:CreateSnapshot
+              - ec2:AttachVolume
+              - ec2:DetachVolume
+              - ec2:ModifyVolume
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeInstances
+              - ec2:DescribeSnapshots
+              - ec2:DescribeTags
+              - ec2:DescribeVolumes
+              - ec2:DescribeVolumesModifications
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ec2:CreateTags
+            Resource:
+              - arn:aws:ec2:*:*:volume/*
+              - arn:aws:ec2:*:*:snapshot/*
+            Condition:
+              StringEquals:
+                ec2:CreateAction:
+                  - CreateVolume
+                  - CreateSnapshot
+          - Effect: Allow
+            Action:
+              - ec2:DeleteTags
+            Resource:
+              - arn:aws:ec2:*:*:volume/*
+              - arn:aws:ec2:*:*:snapshot/*
+          - Effect: Allow
+            Action:
+              - ec2:CreateVolume
+            Resource: '*'
+            Condition:
+              StringLike:
+                aws:RequestTag/ebs.csi.aws.com/cluster: 'true'
+          - Effect: Allow
+            Action:
+              - ec2:CreateVolume
+            Resource: '*'
+            Condition:
+              StringLike:
+                aws:RequestTag/CSIVolumeName: '*'
+          - Effect: Allow
+            Action:
+              - ec2:DeleteVolume
+            Resource: '*'
+            Condition:
+              StringLike:
+                ec2:ResourceTag/ebs.csi.aws.com/cluster: 'true'
+          - Effect: Allow
+            Action:
+              - ec2:DeleteVolume
+            Resource: '*'
+            Condition:
+              StringLike:
+                ec2:ResourceTag/CSIVolumeName: '*'
+          - Effect: Allow
+            Action:
+              - ec2:DeleteVolume
+            Resource: '*'
+            Condition:
+              StringLike:
+                ec2:ResourceTag/kubernetes.io/created-for/pvc/name: '*'
+          - Effect: Allow
+            Action:
+              - ec2:DeleteSnapshot
+            Resource: '*'
+            Condition:
+              StringLike:
+                ec2:ResourceTag/CSIVolumeSnapshotName: '*'
+          - Effect: Allow
+            Action:
+              - ec2:DeleteSnapshot
+            Resource: '*'
+            Condition:
+              StringLike:
+                ec2:ResourceTag/ebs.csi.aws.com/cluster: 'true'
+      Roles:
+        - !Ref EKSNodeRole
+
+Outputs:
+  ClusterName:
+    Description: EKS Cluster Name
+    Value: !Ref EKSCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterName
+
+  ClusterEndpoint:
+    Description: EKS Cluster Endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterEndpoint
+
+  ClusterArn:
+    Description: EKS Cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterArn
+
+  ClusterOIDCIssuer:
+    Description: EKS Cluster OIDC Issuer URL
+    Value: !GetAtt EKSCluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub ${EnvironmentName}-ClusterOIDCIssuer
+
+  NodeRoleArn:
+    Description: Node Group IAM Role ARN
+    Value: !GetAtt EKSNodeRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-NodeRoleArn
+
+  OIDCProviderArn:
+    Description: OIDC Provider ARN
+    Value: !GetAtt EKSClusterOIDCProvider.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-OIDCProviderArn
